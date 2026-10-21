@@ -8,14 +8,13 @@
 
 读完本章后，你应该能够解答如下的问题：
 
-- 解释 API Server 并发和批处理并行的区别和解决的问题；
+- 解释 API Server 并发和批处理并行的区别（它们分别解决了什么问题）；
 - 区分服务整体的输出吞吐量（token/s）与单用户生成速度（token/s/user），理解整体吞吐量提高不一定意味着每位用户的生成速度都提高；
-- 通过静态批处理和连续批处理的性能差异，深刻理解连续批处理解决的问题；
-- 理解连续批处理在迭代中更新请求集合的方式，以及 KV Cache 如何支持连续批处理；
-- 描述请求选择、batch 组装、模型执行、状态更新和结束清理的基本流程；
+- 说明 Prefill batch 和 Decode batch 如何组织输入、计算 Attention 并生成或复用 KV Cache；
+- 结合后台调度循环，解释请求如何逐轮加入、保留和退出 batch，以及 batch 变化后如何继续访问各自的 KV Cache；
+- 理解 mini-sglang 的 Prefill 优先策略，以及 token 预算、请求槽位和 KV Cache 容量如何限制本轮工作；
 
-
-## 2 从并发请求到批处理
+## 2 从并发请求到单次批处理
 
 ### 2.1 用批处理提高系统吞吐
 
@@ -133,116 +132,234 @@ def select_next_batch():
 
 ### 2.4 prefill batch
 
-prefill batch 把多条请求尚未计算的输入组织到一次前向中。假设 A、B 的文本编码后分别得到 `[123, 456, 789]` 和 `[321, 654]`，为了直观看出 batch 维，可以表示为：
+prefill batch 把多条请求尚未计算的输入组织到一次前向中。假设 A、B、C  在这一轮被调度为一个 prefill batch，它们的文本编码后分别得到 `[123, 456, 789]`、`[321, 654]` 和 `[987]`，假设此时都没有可复用的历史 KV。mini-sglang 会把它们的有效 token 打包到一起：
 
 ```python
-input_ids = [
-    [123, 456, 789],
-    [321, 654, PAD],
-]  # [B, T] = [2, 3]；PAD 只是补齐位置，不属于 B 的有效输入。
+input_ids = [123, 456, 789, 321, 654, 987]  # [6]，依次属于 A、B、C
 ```
 
-这里 `B` 是请求数，`T` 是补齐后的序列长度，Embedding 后的形状为 `[B, T, d_model]`。mini-sglang 实际会连续存放有效 token，并记录每条请求的边界，避免在这个例子的补齐位置上计算。无论怎样存放，A、B 的上下文都保持独立，Attention 不会把两条请求当成同一段文本。
+Embedding 后得到的 tensor 的 shape 为 `[6, d_model]`，这 6 个 token 一起参与后续的线性层计算。调度器同时准备每个 token 在原请求中的位置、各请求的序列边界，以及本轮 K/V 将写入的缓存位置。进入每一层 Transformer 后，一起计算 Q/K/V，按头组织后，Q 的形状为 `[6, H_q, D]`，新 K、V 各为 `[6, H_kv, D]`，其中 `H_q`、`H_kv` 分别是 Query 和 KV 的头数，`D` 是每个头的维度。K 应用位置编码后，与 V 一起成为这一层需要保存的 KV Cache 数据。
 
-前向过程中，模型为各请求的输入计算并保存每层 K/V，完整 Prefill 结束后分别预测首个输出 token。后续 Decode 就可以复用这些 KV，无须重新计算整段输入。如果已有可复用的前缀 KV，或者输入被分块处理，则本轮只计算尚未缓存的部分。具体的张量打包、位置和边界元数据，留到代码走读中展开。
+这份 K/V 沿 token 维依次对应 A、B、C，因此这一层为三条请求生成的缓存，逻辑上可以分为：
+
+| 请求 | K 的形状 | V 的形状 |
+| --- | --- | --- |
+| A | `[3, H_kv, D]` | `[3, H_kv, D]` |
+| B | `[2, H_kv, D]` | `[2, H_kv, D]` |
+| C | `[1, H_kv, D]` | `[1, H_kv, D]` |
+
+上述表格的这些 tensor 就是需要写入 kv cache 的 tensor。然后继续参与后续的 Attention 计算，直到得到这一层 transformer 的输出。
+
+值得一提的是，**A，B，C 的 KV 长度不同，不代表计算 Attention 时必须打个 `for i in range(3)` 循环去计算 Attention，也不需要先把 KV 补齐成相同长度。** mini-sglang 底层通过 FlashInfer 来调用底层的 Attention 内核从而完成并行化的 batch 的 Attention 计算。我们可以先把变长请求的批量 Attention 看成一个黑盒，由底层 Attention 算子组织并行计算。
+
+NVIDIA cuDNN 的 Attention 和华为 CANN 的 ATB 算子都提供了变长批量 Attention 的能力。以 CANN 为例，这里的普通 Prefill 对应 `SelfAttentionOperation` 的 `PA_ENCODER` 模式，输入接口可简化表示为：
+
+```text
+query：  [6, H_q, D]
+key：    [6, H_kv, D]
+value：  [6, H_kv, D]
+seqLen： [3, 2, 1]，分别对应 A、B、C
+mask：   因果掩码，按各请求的长度应用
+```
+
+输出形如 `[6, H_q, D]` 的 tensor。这里展示的是 CANN 普通 Prefill 场景的接口；mini-sglang 的实际 Backend 调用留到代码走读中介绍。
+
+除了加入 batch 维度后 Attention 计算的差异外，causal mask 也有点差异。如图 6.3 所示。组成 batch 后的 causal mask 从过去的下三角变为了分块矩阵的下三角。
+
+<div align="center">
+  <img src="./images/6-3-Prefill批处理与注意力掩码.png" width="800" alt="A、B、C 的 3、2、1 个 token 打包后共同做投影；逻辑注意力掩码为块对角形式，各请求块内下三角可见，跨请求位置全部屏蔽，最终输出形状为 [6, H_q, D]。">
+  <p><em>图 6.3 Prefill 的 token 打包与逻辑注意力掩码</em></p>
+</div>
+
+当然，这些底层也都做了支持和优化，mini-sglang 通过请求边界和 causal 参数表达这一约束，无须实际构造完整的 `[6, 6]` mask。
+
+合并头维并经过输出投影后，恢复为 `[6, d_model]`，继续后面的 MLP 和 Transformer 层。完整 Prefill 结束时，LM Head 取各请求最后一个输入位置的隐藏状态，得到 `[3, vocab_size]` 的 logits，再分别采样得到首个输出 token。各层已经写入的 KV 则保留在缓存池中，供后续 Decode 使用。
 
 ### 2.5 decode batch
 
-普通 decode batch 则让每条请求各提供一个新 token，在同一次前向中分别预测下一个 token。三条请求的输入可以表示为 `[B, 1] = [3, 1]`，Embedding 后为 `[3, 1, d_model]`；mini-sglang 将本轮有效 token 打包后，对应 `[3, d_model]`。调度器同时准备各请求的序列位置、历史长度和 KV Cache 地址映射。
+普通 decode batch 则让每条请求各提供一个新 token，在同一次前向中分别预测下一个 token。三条请求的输入的 tensor shape 为 `[3, 1]`，Embedding 后为 `[3, 1, d_model]`；mini-sglang 将本轮有效 token 打包后，对应 `[3, d_model]`。调度器同时准备各请求的序列位置、历史长度和 KV Cache 地址映射。
 
-每层 Q/K/V 投影得到的 Q 形状为 `[3, H_q, D]`，新 K、V 各为 `[3, H_kv, D]`，其中 `H_q`、`H_kv` 分别为 Query 和 KV 的头数，`D` 为每个头的维度。真正读取缓存的是 Attention：它根据映射找到各请求在该层的历史 KV，写入新 K/V，再让每条请求的一个 Query 分别访问形状为 `[L_i, H_kv, D]` 的 K 和 V，其中 `L_i` 是该请求包含本轮 token 的上下文长度。虽然各请求的 `L_i` 不同，Attention 输出仍可合为 `[3, H_q, D]`，合并头维后为 `[3, H_q * D]`，经输出投影和 MLP 继续以 `[3, d_model]` 的形状计算。经过所有 Transformer 层后，LM Head 得到 `[3, vocab_size]` 的 logits，分别采样得到三条请求的下一个 token。这里省略了多卡分片和执行时补齐的细节。
+进入每一层 Transformer 后，三条请求的当前 token 一起做 Q/K/V 投影。按头组织后，Q 的形状为 `[3, H_q, D]`，新 K、V 各为 `[3, H_kv, D]`。**Embedding 和这些投影都不需要读取历史 KV，真正读取缓存的是后面的 Attention。** 关于每层保存什么，以及如何写入新 K/V、用当前 Q 查询已有 K/V，可以回看第 4 章 KV Cache 的讨论。
 
-因此，batch 内的请求不需要处于相同的自回归轮数。图 6.3 中，A、B、C 已有的 KV 长度分别为 7、3、11，本轮各处理一个 token。模型分别读取它们自己的历史、追加本轮新 KV，再为每条请求采样。A 即使已经生成很久，也可以和刚开始生成的 B 一起执行。
+Decode 时，各请求可访问的上下文长度也可能不同。假设 A、B、C 原有的 KV 长度分别为 7、3、11，写入本轮新 K/V 后，各请求参与 Attention 的逻辑形状如下：
+
+| 请求 | 当前 Q | 包含本轮 token 的 K、V | Attention 输出 |
+| --- | --- | --- | --- |
+| A | `[1, H_q, D]` | 各为 `[8, H_kv, D]` | `[1, H_q, D]` |
+| B | `[1, H_q, D]` | 各为 `[4, H_kv, D]` | `[1, H_q, D]` |
+| C | `[1, H_q, D]` | 各为 `[12, H_kv, D]` | `[1, H_q, D]` |
+
+表中的 KV 形状表示各请求逻辑上可以访问的数据，不代表底层单独分配或复制了三个连续张量。Decode 也使用前面介绍的 Attention 内核实现批量化并行计算。Attention 输出仍为 `[3, H_q, D]`。
+
+合并头维并经过输出投影后，恢复为 `[3, d_model]`，再继续后面的 MLP 和 Transformer 层；每层读取各自的 KV Cache。最终 LM Head 得到 `[3, vocab_size]` 的 logits，分别采样得到三条请求的下一个 token。
+
+因此，三条请求可以处于不同的生成进度，却共享一次 Decode 前向；各请求的注意力计算仍保持独立。如图 6.4 所示，A、B、C 本轮分别处理位置 7、3、11 的 token，完全可以放进同一个 decode batch。
 
 <div align="center">
-  <img src="./images/6-3-Decode批处理时间线.png" width="800" alt="时间线与图 6.2 对应：A 在 t0 到 t1 完成 Prefill，t1 到 t2 执行 D1；B、C 在 t2 到 t3 完成 Prefill，A 在此期间等待。本轮 t3 到 t4，A 的 D2 与 B、C 的 D1 共同执行，分别处理位置 7、3、11 的 token。灰色为已执行步骤，实色为本轮，淡色虚线为未来步骤。">
-  <p><em>图 6.3 不同进度的请求共享一次 Decode 前向</em></p>
+  <img src="./images/6-4-Decode批处理时间线.png" width="800" alt="时间线与图 6.2 对应：A 在 t0 到 t1 完成 Prefill，t1 到 t2 执行 D1；B、C 在 t2 到 t3 完成 Prefill，A 在此期间等待。本轮 t3 到 t4，A 的 D2 与 B、C 的 D1 共同执行，分别处理位置 7、3、11 的 token。灰色为已执行步骤，实色为本轮，淡色虚线为未来步骤。">
+  <p><em>图 6.4 不同进度的请求共享一次 Decode 前向</em></p>
 </div>
 
-batch 的成员和排列可以变化，但每条请求的历史状态仍然独立保留。即使 A 结束、B 在下一轮 batch 中的位置前移，B 也能继续使用自己的 KV Cache，不需要搬迁或重算完整历史。如何通过请求标识和缓存映射保持这种对应关系，我们在代码走读中再看。
+batch 的成员和排列可以变化，但每条请求的历史状态仍然独立保留。可能有的读者读到这里会有一定的疑问：“当前的图 6.4 中为什么组装的 decode batch 是连续的 [A,B,C]，即 t3 时刻的 decode batch 就是 [A,B,C]，t5 时刻的 decode batch 仍然是 [A,B,C]，有没有可能中途由于什么原因 [A,B,C] 的 batch 被别的请求插队打散了呢？比如变为 [D,A,B] 呢？“ 这是一个很好的问题，因为这个问题就从批处理引申到了连续批处理（毕竟要考虑时序上的关系了）。我们会在下一节对这个问题加以解答。
 
-## 3 从静态批处理到连续批处理
+**检查一下**：和 batch_size = 1 相比，batch_size > 1 的批处理的 PD 阶段分别有什么不同和相同的地方。
 
-### 3.1 静态批处理怎样组织请求
+## 3 调度循环中 batch 的成员如何变化
 
-理解了单次前向怎样组织输入后，还需要决定一个 batch 的成员在多次前向之间是否变化。静态批处理预先确定一组请求，再逐轮执行它们的生成过程。在整批完成前，不接纳新的请求进入这组计算；已经结束的成员可以停止参与有效计算，但空出的容量不会因此自动补入新请求。
+### 3.1 每轮前向之后重新选择请求
 
-### 3.2 请求长度不同会带来什么问题
+上一节中，我们了解了一下要如何组织一次 PD 分离架构下 batch 一次性计算多次不同请求的 token 生成自回归。从而从形式上提升了我们系统的吞吐。
 
-如果 A 需要生成很长的回答，而 B、C 很快完成，那么后续计算主要在继续推进 A。此时新到达的请求即使很短，也可能需要等到这一批整体结束才能被接纳。请求的到达时间、输入长度和生成长度不一致，使固定批次难以持续利用可用容量，也会拉长新请求的等待时间。
+但是正如我们上一节末尾留下的问题一下，我们现在还需要知道每一次组装 prefill/decode batch 时，要如何基于上一次 batch 的请求组合选择这一次的请求组合。比如我们在同一时刻接受到 5 条不同的请求 A，B，C，D，E，但是我们设置的最大 batch size 只有 2，那么当我们在 $t$ 时刻调度了 $[A_{\text{decode}}, B_{\text{decode}}]$ 后，$t+1$ 时刻会不会调度 $[B_{\text{decode}}, D_{\text{decode}}]$，还是仍然调度 $[A_{\text{decode}}, B_{\text{decode}}]$ 呢？
 
-### 3.3 连续批处理怎样在迭代之间更新 batch
+把目光放回 2.2 的 `while` 循环这个基础的调度模型里面，想要解答上面的疑问，其实只需要弄清楚 `select_next_batch` 这个函数内部在调度 prefill 和 decode 的 batch 时具体是如何根据历史调度记录选择当前需要调度的请求就行了。
 
-连续批处理将重新组织请求集合的机会放在模型执行的迭代之间：已完成或取消的请求退出，仍需生成的请求保留，新请求在资源允许时被接纳。请求的 KV Cache 跨迭代保留，因此 batch 成员和排列发生变化后，已有请求仍能接着自己的历史计算。连续批处理不要求每次重新计算全部上下文，也不要求采用 Prefill 与 Decode 混合的执行 batch。
+我们把选择器展开成下面的概念伪代码。它每轮先尝试组装 Prefill batch，无法组成可执行的 Prefill batch 时，再选择 Decode：
 
-### 3.4 根据当前请求与资源选择本轮工作
+```python
+# 概念伪代码，具体实现留到代码走读中展开。
+def select_next_batch():
+    batch = prefill_manager.schedule_next_batch(prefill_budget)
+    if batch is not None:
+        return batch
+    return decode_manager.schedule_next_batch()
+```
 
-当前 mini-sglang 没有“等待固定时间，直到 batch 凑满或超时再执行”的机制。系统空闲时会阻塞等待消息；已有工作时，则收集通道中已经到达的消息，并尝试组成下一批计算。即使只有一条请求，只要满足执行条件，也可以独自组成 batch。
+这两个方法面对的请求集合不同：前者从尚未完成 Prefill 的等待请求中接纳本轮工作，后者让已经进入运行集合的请求继续生成。它们依据的是之前各轮留下的请求状态。
 
-选择请求时，需要同时考虑本轮 Prefill 的 token 预算、可用请求表槽位和 KV Cache 容量，还要为运行中请求后续生成预留空间。预算不足时，长 prompt 可以分块处理；资源不足时，未被接纳的请求继续排队。最大容量是上限，不是每一轮必须凑够的数量。
+### 3.2 Prefill：从等待请求中接纳本轮工作
 
-### 3.5 Prefill 优先如何影响已有请求
+`prefill_manager.schedule_next_batch` 按等待顺序取出尚未完成 Prefill 的请求，将本轮 token 预算内的输入组成 batch：
+
+```python
+# 概念伪代码，资源检查和具体状态维护留到代码走读中说明。
+def schedule_prefill_next_batch(token_budget):
+    batch = []
+    for req in waiting_requests:
+        if token_budget <= 0 or not resources_allow(req):
+            break
+
+        inputs = take_unprocessed_inputs(req, limit=token_budget)
+        batch.append((req, inputs))
+        token_budget -= len(inputs)
+
+    update_waiting_requests(batch)  # 未完成的分块请求留待后续处理
+    return Batch(batch, phase="prefill") if batch else None
+```
+
+这里的预算限制输入 token 总数，而不是请求数。比如预算为 5，A、B 分别有 3、4 个待处理 token，本轮就可以处理 A 的 3 个和 B 的前 2 个；B 剩余的输入在后续 Prefill 中继续处理，完整 Prefill 后才能进入 Decode。请求槽位、KV 容量等检查统一放在 `resources_allow` 中；如果本轮没有选出请求，就返回 `None`，由外层选择器尝试 Decode。
+
+### 3.3 Decode：让运行中的请求继续生成
+
+`decode_manager.schedule_next_batch` 面对的是已经进入运行集合、仍需生成的请求。相比 Prefill，它不需要重新接纳请求或切分输入，而是选出全部运行请求，每条推进一步：
+
+```python
+# 概念伪代码，运行集合由请求状态更新逻辑维护。
+def schedule_decode_next_batch():
+    if not running_requests:
+        return None
+
+    requests = sorted(running_requests, key=lambda req: req.uid)
+
+    # 每条请求提供一个 token，历史上下文通过 KV Cache 访问
+    return Batch(requests, phase="decode")
+```
+
+当前 mini-sglang 按 `uid` 排列运行请求，但这个排序只是确定 batch 的排列顺序，不是在比较谁更应该得到执行机会。只要运行集合非空，就全部选入本轮 Decode batch；如果为空，则返回 `None`。
+
+因此，假设 `uid_A < uid_B`，当前只有 A、B 正在运行，两者都未结束或取消，且没有新成员加入，那么下一轮选择 Decode 时仍然会得到 `[A, B]`，不会因为“轮到 D 了”就换成 `[B, D]`。D 需要先获准进入、完成 Prefill，并加入运行集合，才会参与后续 Decode。
+
+回到 3.1 假设的最大 batch size 为 2，如果这个容量上限已经被 A、B 占满，D 就要等待接纳机会，而不是挤走其中一条。实际的请求容量和资源限制如何设置，我们在代码走读中说明。
+
+### 3.4 请求如何加入和退出运行集合
+
+每轮计算推进请求的进度，随后更新等待和运行集合。这个过程可以概括为：
+
+```python
+# 概念伪代码，省略 CPU/GPU 重叠执行和缓存回收策略。
+def update_requests(batch, outputs):
+    for req in batch.requests:
+        advance_progress(req, outputs)
+
+        if finished_or_cancelled(req):
+            remove_from_queues(req)
+            release_resources(req)
+        elif prefill_finished(req):
+            remove_from_waiting(req)
+            running_requests.add(req)
+        # Prefill 尚未完成的请求继续等待；已有 Decode 请求继续留在运行集合。
+```
+
+例如 A、B、C 正在 Decode，D 到达且资源允许接纳，就可能出现：
+
+```text
+Decode [A, B, C]
+Prefill [D]          # A、B、C 保留状态和 KV，等待后续执行
+Decode [A, B, C, D]  # D 完成 Prefill 且仍需生成，加入运行集合
+```
+
+如果 C 在此期间结束或被取消，后续 Decode batch 就可能成为 `[A, B, D]`。这是 C 退出、D 加入的结果。当前 mini-sglang 不会为了接纳 D 而抢占仍在生成的 C。
+
+batch 的成员和排列发生变化，也不需要重算或搬迁已有请求的完整 KV：每条请求仍通过自己的映射访问缓存。新请求加入无须等待原来整批请求全部生成完，这就是调度循环中连续更新 batch 的过程。
+
+## 4 这一轮选择哪个 phase，接纳多少请求
+
+### 4.1 Prefill 优先如何影响已有请求
 
 系统中可以同时有等待 Prefill 的新请求和正在 Decode 的请求，但当前实现每轮只选一个 phase 组成执行 batch。例如 A 正在生成，B、C 刚到达，选择器需要决定先继续 A 的 Decode，还是处理 B、C 的 Prefill；没有被选中的请求保留状态和已有 KV，等待后续调度。
 
-当前 `scheduler/scheduler.py` 中选择 batch 的核心逻辑如下：
+按 3.1 的选择器，只有无法组成可执行的 Prefill batch 时，才转向 Decode。
 
-```python
-# 源码节选：优先选择可执行的 Prefill batch，否则选择 Decode batch。
-batch = (
-    self.prefill_manager.schedule_next_batch(self.prefill_budget)
-    or self.decode_manager.schedule_next_batch()
-)
-```
+这解释了图 6.2 中两种不同的等待。B、C 在 A 的 D1 已提交后到达，图中假设它们在下一次收集消息时都已准备好，因此共同参与下一轮 Prefill；B 等的是调度机会，不是在主动等待 C 凑批。而 t2 到 t3 期间，A 的 Decode 暂停，是因为本轮优先执行 B、C 的 Prefill。A 仍在运行集合中，历史 KV 也继续保留，这和将 A 移出运行集合是两回事。
 
-这解释了图 6.2 中两种不同的等待。B、C 在 A 的 D1 已提交后到达，图中假设它们在下一次收集消息时都已准备好，因此共同参与下一轮 Prefill；B 等的是调度机会，不是在主动等待 C 凑批。而 t2 到 t3 期间，A 的 Decode 暂停，是因为本轮优先执行 B、C 的 Prefill。当前实现将两种阶段放在不同 batch 中，A 的历史 KV 在此期间继续保留。
+图 6.2 忽略了 CPU/GPU 重叠调度的细节，表示一种可能的执行顺序，而不是固定时间表。这里讨论的是同一后端内两个计算阶段的安排，不要求将 Prefill 与 Decode 部署在不同 GPU 上。
 
-图 6.2 忽略了 CPU/GPU 重叠调度的细节，表示一种可能的执行顺序，而不是固定时间表。若下一次收集消息时只有 B，且资源允许，就可以先处理 B，无须等 C 到达。这里讨论的是同一后端内两个计算阶段的安排，不要求将 Prefill 与 Decode 部署在不同 GPU 上。
+### 4.2 接纳新请求时也要考虑已有请求
 
-### 3.6 更新生成进度与请求生命周期
+3.2 中的资源检查并非只看“眼下还能塞多少 prompt”。接纳检查还需要计入运行中请求后续生成所需的空间，再判断能否加入新请求。因此，某条请求即使本轮 Prefill 很短，也可能因为后续输出空间不足而继续等待。
 
-模型执行后，采样器按照每条请求自己的生成参数选出下一个 token。对图 6.3 的例子，本轮输入 token ID 为 901、902、903，假设分别采样得到 token ID 911、912、913（仅为示意），随后分别写回各请求的 token 存储。刚采样出的 token 要到下一轮输入模型时，才会产生它自己的 KV。
+这也是 Prefill 方法可能返回 `None` 的原因：等待列表非空，不代表当前有能力接纳其中的请求。此时选择器仍可转向 Decode，推进已有请求；请求结束后释放的资源，则让后续接纳成为可能。
 
-Scheduler 再检查哪些请求达到生成长度上限或生成了 EOS，将已完成请求移出运行集合，并处理请求表槽位与缓存资源。可复用的前缀 KV 不一定立即删除，而是按缓存策略保留或淘汰；生成结果则携带 `uid` 经 Detokenizer 返回 API Server。取消请求也通过同一个身份标识定位，停止后续调度并处理资源。
+### 4.3 有工作就执行，不等待 batch 凑满
 
-这样，每轮前向推进的是当前 batch 中各请求自己的状态，而不是让整批请求共享一个生成进度。默认的重叠调度还会让部分 CPU 状态处理与 GPU 执行重叠，但不会把已经提交的 batch 临时改成包含新到达请求的另一个 batch。
+当前 mini-sglang 没有“等待固定时间，直到 batch 凑满或超时再执行”的机制。系统空闲时会阻塞等待消息；已有工作时，则收集通道中已经到达的消息，并尝试组成下一批计算。即使只有一条请求，只要满足执行条件，也可以独自组成 batch。
 
-## 4 Prefill 与 Decode 怎样参与调度
+对应图 6.2，若下一次收集消息时只有 B，且资源允许，就可以先处理 B，无须等 C 到达。容量和预算是本轮执行的上限，不是每一轮必须凑够的数量。
 
-### 4.1 两个阶段的计算特点有什么不同
+## 5 怎样评估调度效果
 
-### 4.2 新请求怎样从 Prefill 进入 Decode
+### 5.1 整体吞吐量与单用户生成速度
 
-### 4.3 Prefill 与 Decode 怎样安排执行顺序
+2.1 的实验已经说明，batch 变大后，整体 token/s 可以明显提高，但 token/s/user 不一定提高。调度效果需要同时看系统在单位时间内产出了多少 token，以及每个用户实际等了多久、生成得多快，不能只用 batch 大小或 GPU 利用率判断。
 
-## 5 调度器怎样组织一次迭代
+### 5.2 请求等待与 Prefill 对 Decode 延迟的影响
 
-### 5.1 管理等待请求与运行中的请求
+新请求排队等待接纳，会增加 TTFT；已有请求等待 Prefill batch 执行，则会增加相邻输出 token 之间的间隔。评估时既要观察新请求的首 token 延迟，也要观察生成中的 TPOT 或 token 输出间隔，才能看清 Prefill 优先策略的影响。
 
-### 5.2 根据 token 预算与 KV Cache 容量选择请求
+### 5.3 token 预算与 KV 占用的取舍
 
-### 5.3 组装 batch 并交给 engine 执行
+提高 Prefill token 预算，可以让一轮处理更多输入，但也可能让正在等待的 Decode 请求更久得不到执行。接纳更多运行请求有助于扩大 Decode batch，同时也会占用更多 KV 容量。具体取值需要结合输入长度、输出长度和到达流量，通过吞吐与延迟指标一起评估。
 
-### 5.4 更新请求状态，处理结束与取消
+## 6 总结与测试题
 
-## 6 怎样评估调度效果
+### 6.1 课程总结
 
-### 6.1 吞吐量与请求延迟怎样衡量
+本章从 API Server 的并发接入出发，说明了 Prefill batch 和 Decode batch 如何组织多条请求的前向计算。批量计算时，token 可以打包在一起，但请求边界、位置和缓存映射保证各自的上下文保持独立。
 
-### 6.2 batch 大小与调度策略怎样影响性能
+回到调度循环，mini-sglang 优先尝试按等待顺序和资源预算组建 Prefill batch；无法组成可执行的 Prefill batch 时，再选择全部运行中的 Decode 请求。请求在迭代之间加入、保留和退出，KV Cache 则按请求跨迭代保留。评估这一过程，既要看整体吞吐，也要看新请求等待和已有请求的生成延迟。
 
-### 6.3 怎样比较静态批处理与连续批处理
+### 6.2 测试题
 
-## 7 总结与测试题
+1. API Server 和连续批处理分别解决了什么场景的什么问题？
 
-### 7.1 课程总结
+2. 为什么 mini-sglang 中不支持不同 phase 的请求放在同一个 batch 进行前向？
 
-### 7.2 测试题
+3. 解释一下图 6.2 中请求 A 和请求 B 发生的两次等待的原因。
 
-1. 为什么 mini-sglang 中不支持不同 phase 的请求放在同一个 batch 进行前向？
-
-2. 解释一下图 6.2 中请求 A 和请求 B 发生的两次等待的原因。
+4. 假设 mini-sglang 当前的 Decode batch 为 `[A, B, C]`，三条请求都未结束或取消。如果没有新请求加入，下一轮选择 Decode 时会得到什么 batch？如果 D 在此期间完成 Prefill 且仍需生成，结果又会怎样？
 
 ## 参考资料
 
 - [OSDI 2024：混合批处理与分块 Prefill 的实验研究（§4.2、表 4）](https://www.usenix.org/system/files/osdi24-agrawal.pdf)
+- [NVIDIA cuDNN：Attention](https://docs.nvidia.com/deeplearning/cudnn/latest/operations/Attention.html)
+- [CANN ATB：SelfAttentionOperation（PA_ENCODER 输入输出）](https://www.hiascend.com/document/detail/zh/canncommercial/80RC2/apiref/ascendtbapi/ascendtb_01_0076.html)
