@@ -208,7 +208,7 @@ batch 的成员和排列可以变化，但每条请求的历史状态仍然独�
 
 ### 3.1 每轮前向之后重新选择请求
 
-上一节中，我们了解了一下要如何组织一次 PD 分离架构下 batch 一次性计算多次不同请求的 token 生成自回归。从而从形式上提升了我们系统的吞吐。
+上一节中，我们了解了一下要如何组织一次 PD 分离架构下 batch，来一次性计算多次不同请求的 token 生成自回归，从而从形式上提升了我们系统的吞吐。
 
 但是正如我们上一节末尾留下的问题一下，我们现在还需要知道每一次组装 prefill/decode batch 时，要如何基于上一次 batch 的请求组合选择这一次的请求组合。比如我们在同一时刻接受到 5 条不同的请求 A，B，C，D，E，但是我们设置的最大 batch size 只有 2，那么当我们在 $t$ 时刻调度了 $[A_{\text{decode}}, B_{\text{decode}}]$ 后，$t+1$ 时刻会不会调度 $[B_{\text{decode}}, D_{\text{decode}}]$，还是仍然调度 $[A_{\text{decode}}, B_{\text{decode}}]$ 呢？
 
@@ -225,33 +225,17 @@ def select_next_batch():
     return decode_manager.schedule_next_batch()
 ```
 
-这两个方法面对的请求集合不同：前者从尚未完成 Prefill 的等待请求中接纳本轮工作，后者让已经进入运行集合的请求继续生成。它们依据的是之前各轮留下的请求状态。
+可以看到，实际上下一轮 batch 的调度分别依赖 prefill 下一轮的调度和 decode 下一轮的调度这两个逻辑，下面我们分别来看。
 
 ### 3.2 Prefill：从等待请求中接纳本轮工作
 
-`prefill_manager.schedule_next_batch` 按等待顺序取出尚未完成 Prefill 的请求，将本轮 token 预算内的输入组成 batch：
+prefill 在整体属于相对低频的事件，它的 batch 调度逻辑也非常简单：把等待 prefill 的请求输入组成 batch，直到本轮 token 预算用完，或者资源不足以接纳下一条请求。预算限制的是输入 token 总数，不是请求数；一条请求的输入太长时，可以先算一部分，剩余部分留到后续 Prefill，全部处理完才能进入 Decode。
 
-```python
-# 概念伪代码，资源检查和具体状态维护留到代码走读中说明。
-def schedule_prefill_next_batch(token_budget):
-    batch = []
-    for req in waiting_requests:
-        if token_budget <= 0 or not resources_allow(req):
-            break
-
-        inputs = take_unprocessed_inputs(req, limit=token_budget)
-        batch.append((req, inputs))
-        token_budget -= len(inputs)
-
-    update_waiting_requests(batch)  # 未完成的分块请求留待后续处理
-    return Batch(batch, phase="prefill") if batch else None
-```
-
-这里的预算限制输入 token 总数，而不是请求数。比如预算为 5，A、B 分别有 3、4 个待处理 token，本轮就可以处理 A 的 3 个和 B 的前 2 个；B 剩余的输入在后续 Prefill 中继续处理，完整 Prefill 后才能进入 Decode。请求槽位、KV 容量等检查统一放在 `resources_allow` 中；如果本轮没有选出请求，就返回 `None`，由外层选择器尝试 Decode。
+如果本轮一条请求都没选中，就交给外层选择器尝试 Decode。
 
 ### 3.3 Decode：让运行中的请求继续生成
 
-`decode_manager.schedule_next_batch` 面对的是已经进入运行集合、仍需生成的请求。相比 Prefill，它不需要重新接纳请求或切分输入，而是选出全部运行请求，每条推进一步：
+相比 Prefill，decode 阶段不需要重新接纳请求或切分输入，而是选出全部运行请求，每条推进一步：
 
 ```python
 # 概念伪代码，运行集合由请求状态更新逻辑维护。
@@ -265,11 +249,20 @@ def schedule_decode_next_batch():
     return Batch(requests, phase="decode")
 ```
 
+这里的 `running_requests` 是跨循环保留的运行集合，**选中请求只会读取这个集合，不会把请求取走。** 每轮结果处理时，已完成 Prefill 且仍需生成的请求加入集合，达到最大输出长度、生成 EOS 或被取消的请求移出集合；其余请求继续保留。具体更新过程见下一小节。
+
 当前 mini-sglang 按 `uid` 排列运行请求，但这个排序只是确定 batch 的排列顺序，不是在比较谁更应该得到执行机会。只要运行集合非空，就全部选入本轮 Decode batch；如果为空，则返回 `None`。
 
-因此，假设 `uid_A < uid_B`，当前只有 A、B 正在运行，两者都未结束或取消，且没有新成员加入，那么下一轮选择 Decode 时仍然会得到 `[A, B]`，不会因为“轮到 D 了”就换成 `[B, D]`。D 需要先获准进入、完成 Prefill，并加入运行集合，才会参与后续 Decode。
+因此，假设 `uid_A < uid_B < uid_C`，本轮选中了 `[A, B, C]`，三者都未达到最大输出长度、未生成 EOS，也没有被取消，那么处理结果后 `running_requests` 仍是 `{A, B, C}`。如果没有 Prefill 工作和新成员加入，下一轮仍会选中 `[A, B, C]`。D 则需要先获准进入、完成 Prefill，并加入运行集合，才会参与后续 Decode。
 
 回到 3.1 假设的最大 batch size 为 2，如果这个容量上限已经被 A、B 占满，D 就要等待接纳机会，而不是挤走其中一条。实际的请求容量和资源限制如何设置，我们在代码走读中说明。
+
+如图 6.5 所示，Prefill 等待池和 Decode 运行池共用同一条调度管线。每轮由同一个选择器先尝试从 Prefill 池选请求；无法组成可执行的 batch 时，再从 Decode 池选择。本轮只组装一个相同 phase 的 batch，执行前向、更新状态，再进入下一轮选择。
+
+<div align="center">
+  <img src="./images/6-5-Prefill与Decode请求池调度.png" width="800" alt="Prefill 等待池 pending_list 与 Decode 运行池 running_reqs 都连接到同一个 select_next_batch 选择器。每轮先尝试 Prefill，无法组批再选 Decode，随后共用 batch 组装、前向计算和状态更新流程，再返回选择器开始下一轮。">
+  <p><em>图 6.5 两个请求池共用一条调度与执行管线</em></p>
+</div>
 
 ### 3.4 请求如何加入和退出运行集合
 
@@ -282,12 +275,14 @@ def update_requests(batch, outputs):
         advance_progress(req, outputs)
 
         if finished_or_cancelled(req):
-            remove_from_queues(req)
-            release_resources(req)
-        elif prefill_finished(req):
+            running_requests.discard(req)  # 已结束的请求不再进入后续 Decode
             remove_from_waiting(req)
-            running_requests.add(req)
-        # Prefill 尚未完成的请求继续等待；已有 Decode 请求继续留在运行集合。
+            release_resources(req)
+        elif batch.phase == "prefill" and prefill_finished(req):
+            remove_from_waiting(req)
+            running_requests.add(req)      # 完成 Prefill 且仍需生成，加入运行集合
+        # Decode 请求未结束：不移除，下一轮继续选中。
+        # Prefill 尚未完成：继续等待后续 Prefill。
 ```
 
 例如 A、B、C 正在 Decode，D 到达且资源允许接纳，就可能出现：
@@ -318,7 +313,9 @@ batch 的成员和排列发生变化，也不需要重算或搬迁已有请求�
 
 3.2 中的资源检查并非只看“眼下还能塞多少 prompt”。接纳检查还需要计入运行中请求后续生成所需的空间，再判断能否加入新请求。因此，某条请求即使本轮 Prefill 很短，也可能因为后续输出空间不足而继续等待。
 
-这也是 Prefill 方法可能返回 `None` 的原因：等待列表非空，不代表当前有能力接纳其中的请求。此时选择器仍可转向 Decode，推进已有请求；请求结束后释放的资源，则让后续接纳成为可能。
+空闲 KV 空间不足时，如果启用了前缀缓存，系统还可以淘汰当前未被运行请求使用的可复用缓存，回收空间；正在生成的请求所需的 KV 则受到保护。如果仍没有足够空间，新请求就继续等待。哪些缓存可以淘汰、如何回收和复用，留到[第 8 章 RadixAttention 与前缀缓存](./第8章_RadixAttention与前缀缓存.md)展开；本章只关注这些资源条件怎样影响请求接纳。
+
+这也是 Prefill 方法可能返回 `None` 的原因：等待列表非空，不代表当前有能力接纳其中的请求。此时选择器仍可转向 Decode，推进已有请求；请求结束后可回收的资源，则让后续接纳成为可能。
 
 ### 4.3 有工作就执行，不等待 batch 凑满
 
